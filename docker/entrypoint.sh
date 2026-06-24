@@ -26,7 +26,12 @@ if [ "$cur_uid" != "$HOST_UID" ]; then
 fi
 
 # Ensure the (volume-backed) home is owned by the possibly-remapped user.
-chown "$HOST_UID:$HOST_GID" /home/aibox 2>/dev/null || true
+# Recurse only when the top-level owner doesn't already match — this fixes a
+# freshly seeded volume (and the rare host-UID-change case) without paying for a
+# recursive chown on every warm start.
+if [ "$(stat -c %u /home/aibox 2>/dev/null || echo -1)" != "$HOST_UID" ]; then
+  chown -R "$HOST_UID:$HOST_GID" /home/aibox 2>/dev/null || true
+fi
 
 export HOME="/home/aibox"
 export USER="$USER_NAME"

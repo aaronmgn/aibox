@@ -7,14 +7,19 @@ FROM aibox-base:latest
 
 USER root
 
+# The installer drops a launcher symlink at $TOOL_HOME/.local/bin/codex pointing to
+# the real binary under $TOOL_HOME/.codex/packages. Resolve it and link the real
+# binary onto the system PATH. It self-locates its resources via /proc/self/exe and
+# reads user credentials from $HOME/.codex (the volume) at runtime.
 RUN set -eux; \
     export TOOL_HOME=/opt/aibox-tools; \
     mkdir -p "$TOOL_HOME"; \
     HOME="$TOOL_HOME" sh -c 'curl -fsSL https://chatgpt.com/codex/install.sh | sh'; \
-    bin="$(find "$TOOL_HOME" -type f -name codex -perm -u+x 2>/dev/null | head -1)"; \
-    test -n "$bin"; \
-    ln -sf "$bin" /usr/local/bin/codex; \
+    target="$(readlink -f "$TOOL_HOME/.local/bin/codex")"; \
+    test -x "$target"; \
+    ln -sf "$target" /usr/local/bin/codex; \
     chmod -R a+rX "$TOOL_HOME"; \
-    codex --version
+    HOME=/tmp/verify codex --version; \
+    rm -rf /tmp/verify
 
 CMD ["codex"]

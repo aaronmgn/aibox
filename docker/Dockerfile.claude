@@ -9,14 +9,19 @@ FROM aibox-base:latest
 
 USER root
 
+# The installer drops a launcher symlink at $TOOL_HOME/.local/bin/claude pointing
+# to a versioned binary under $TOOL_HOME/.local/share. Resolve it and link the real
+# binary onto the system PATH. The binary self-locates its files via /proc/self/exe
+# and reads user credentials from $HOME/.claude (the volume) at runtime.
 RUN set -eux; \
     export TOOL_HOME=/opt/aibox-tools; \
     mkdir -p "$TOOL_HOME"; \
     HOME="$TOOL_HOME" sh -c 'curl -fsSL https://claude.ai/install.sh | bash'; \
-    bin="$(find "$TOOL_HOME" -type f -name claude -perm -u+x 2>/dev/null | head -1)"; \
-    test -n "$bin"; \
-    ln -sf "$bin" /usr/local/bin/claude; \
+    target="$(readlink -f "$TOOL_HOME/.local/bin/claude")"; \
+    test -x "$target"; \
+    ln -sf "$target" /usr/local/bin/claude; \
     chmod -R a+rX "$TOOL_HOME"; \
-    claude --version
+    HOME=/tmp/verify claude --version; \
+    rm -rf /tmp/verify
 
 CMD ["claude"]
