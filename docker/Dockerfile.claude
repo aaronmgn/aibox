@@ -1,0 +1,22 @@
+# Claude Code on top of the shared base.
+#
+# The CLI is installed under /opt (NOT under /home/aibox) and symlinked onto the
+# system PATH. This matters: /home/aibox is replaced by a named volume at runtime,
+# which would shadow anything installed there and pin a stale version across
+# rebuilds. The binary writes user credentials to $HOME/.claude (the volume) at
+# runtime, while its own program files live in the image at /opt.
+FROM aibox-base:latest
+
+USER root
+
+RUN set -eux; \
+    export TOOL_HOME=/opt/aibox-tools; \
+    mkdir -p "$TOOL_HOME"; \
+    HOME="$TOOL_HOME" sh -c 'curl -fsSL https://claude.ai/install.sh | bash'; \
+    bin="$(find "$TOOL_HOME" -type f -name claude -perm -u+x 2>/dev/null | head -1)"; \
+    test -n "$bin"; \
+    ln -sf "$bin" /usr/local/bin/claude; \
+    chmod -R a+rX "$TOOL_HOME"; \
+    claude --version
+
+CMD ["claude"]

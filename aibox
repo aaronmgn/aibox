@@ -1,0 +1,642 @@
+#!/usr/bin/env bash
+#
+# aibox — run Claude Code and Codex inside isolated, persistent Docker containers.
+#
+# One self-contained script. Targets Linux and macOS. Written to stay compatible
+# with Bash 3.2 (stock macOS): no associative arrays, no mapfile, no ${var,,}, and
+# portable readlink/sed/date idioms.
+#
+set -euo pipefail
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+
+AIBOX_HOME=""        # resolved real directory containing this script (the git checkout)
+CONFIG_DIR=""        # $AIBOX_HOME/config (gitignored runtime state)
+AIBOX_VERSION="0.0.0"
+PLATFORM=""          # linux | macos
+
+readonly BASE_IMAGE="aibox-base:latest"
+readonly TOOLS="claude codex"
+
+# Colors (only when stderr is a terminal).
+if [ -t 2 ]; then
+  C_RED=$'\033[31m'; C_YLW=$'\033[33m'; C_DIM=$'\033[2m'; C_RST=$'\033[0m'
+else
+  C_RED=""; C_YLW=""; C_DIM=""; C_RST=""
+fi
+
+# ---------------------------------------------------------------------------
+# Output & logging helpers
+# ---------------------------------------------------------------------------
+
+log() {
+  # log LEVEL message...   (best-effort; never log secrets here)
+  local lvl="$1"; shift
+  [ -n "${CONFIG_DIR:-}" ] || return 0
+  [ -d "$CONFIG_DIR/logs" ] || return 0
+  printf '%s [%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$lvl" "$*" \
+    >> "$CONFIG_DIR/logs/aibox.log" 2>/dev/null || true
+}
+
+info()  { printf '%s\n' "$*" >&2; }
+warn()  { printf '%swarning:%s %s\n' "$C_YLW" "$C_RST" "$*" >&2; log WARN "$*"; }
+error() { printf '%serror:%s %s\n' "$C_RED" "$C_RST" "$*" >&2; log ERROR "$*"; }
+die()   { error "$*"; exit 1; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+confirm() {
+  # confirm PROMPT [REQUIRED_WORD]
+  # With REQUIRED_WORD: succeeds only on an exact match.
+  # Without it: y/yes (case-insensitive) succeeds.
+  local prompt="$1" want="${2:-}" ans=""
+  printf '%s' "$prompt" >&2
+  read -r ans || return 1
+  if [ -n "$want" ]; then
+    [ "$ans" = "$want" ]
+  else
+    case "$ans" in [yY]|[yY][eE][sS]) return 0 ;; *) return 1 ;; esac
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Self-resolution & platform
+# ---------------------------------------------------------------------------
+
+resolve_self() {
+  # Follow symlinks portably (no readlink -f on macOS) to find the real script dir.
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -h "$src" ]; do
+    dir="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+    src="$(readlink "$src")"
+    case "$src" in
+      /*) ;;
+      *) src="$dir/$src" ;;
+    esac
+  done
+  AIBOX_HOME="$(cd -P "$(dirname "$src")" >/dev/null 2>&1 && pwd)"
+  CONFIG_DIR="$AIBOX_HOME/config"
+}
+
+detect_platform() {
+  local os; os="$(uname -s)"
+  case "$os" in
+    Linux)  PLATFORM="linux"  ;;
+    Darwin) PLATFORM="macos"  ;;
+    *) die "Unsupported OS: $os. AI Box supports Linux and macOS only." ;;
+  esac
+}
+
+load_version() {
+  if [ -f "$AIBOX_HOME/VERSION" ]; then
+    AIBOX_VERSION="$(head -1 "$AIBOX_HOME/VERSION" 2>/dev/null | tr -d '[:space:]')"
+  fi
+  [ -n "${AIBOX_VERSION:-}" ] || AIBOX_VERSION="0.0.0"
+}
+
+# ---------------------------------------------------------------------------
+# Tool metadata (Bash 3.2: plain functions instead of associative arrays)
+# ---------------------------------------------------------------------------
+
+validate_tool() {
+  case "${1:-}" in
+    claude|codex) return 0 ;;
+    *) die "unknown tool '${1:-}' (use 'claude' or 'codex')" ;;
+  esac
+}
+
+tool_image()      { printf 'aibox-%s:latest' "$1"; }
+tool_volume()     { printf 'aibox-%s-home' "$1"; }
+tool_container()  { printf 'aibox-%s' "$1"; }
+tool_dockerfile() { printf '%s/docker/Dockerfile.%s' "$AIBOX_HOME" "$1"; }
+
+# ---------------------------------------------------------------------------
+# Config / state (simple key=value files)
+# ---------------------------------------------------------------------------
+
+get_state() {
+  # get_state KEY [DEFAULT]
+  local key="$1" default="${2:-}" f="$CONFIG_DIR/state.conf" line
+  [ -f "$f" ] || { printf '%s' "$default"; return 0; }
+  line="$(grep -E "^${key}=" "$f" 2>/dev/null | tail -1 || true)"
+  if [ -n "$line" ]; then printf '%s' "${line#*=}"; else printf '%s' "$default"; fi
+}
+
+set_state() {
+  # set_state KEY VALUE  (portable; avoids sed -i differences)
+  local key="$1" val="$2" f="$CONFIG_DIR/state.conf" tmp
+  mkdir -p "$CONFIG_DIR"
+  [ -f "$f" ] || : > "$f"
+  if grep -qE "^${key}=" "$f" 2>/dev/null; then
+    tmp="$(mktemp "${TMPDIR:-/tmp}/aibox.XXXXXX")"
+    grep -vE "^${key}=" "$f" > "$tmp" || true
+    printf '%s=%s\n' "$key" "$val" >> "$tmp"
+    mv "$tmp" "$f"
+  else
+    printf '%s=%s\n' "$key" "$val" >> "$f"
+  fi
+}
+
+write_default_config() {
+  local f="$CONFIG_DIR/aibox.conf"
+  [ -f "$f" ] && return 0
+  cat > "$f" <<'EOF'
+# AI Box configuration (key=value). Safe to edit.
+default_tool=claude
+workspace_mode=current
+log_level=info
+auto_update_check=false
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# First-run bootstrap
+# ---------------------------------------------------------------------------
+
+ensure_gitignore() {
+  local f="$AIBOX_HOME/.gitignore"
+  if [ ! -f "$f" ] || ! grep -qxF 'config/' "$f" 2>/dev/null; then
+    printf 'config/\n' >> "$f"
+  fi
+}
+
+offer_path_setup() {
+  local bindir="$1" rc=""
+  warn "$bindir is not on your PATH."
+  case "${SHELL:-}" in
+    */zsh)  rc="$HOME/.zshrc" ;;
+    */bash) if [ -f "$HOME/.bashrc" ]; then rc="$HOME/.bashrc"; else rc="$HOME/.bash_profile"; fi ;;
+  esac
+  if [ -n "$rc" ] && confirm "Add it to $rc? [y/N] "; then
+    printf '\n# Added by AI Box\nexport PATH="%s:$PATH"\n' "$bindir" >> "$rc"
+    info "Added to $rc. Open a new terminal or run: source $rc"
+  else
+    info "Add this to your shell startup file manually:"
+    info "  export PATH=\"$bindir:\$PATH\""
+  fi
+}
+
+setup_symlink() {
+  local bindir="$HOME/.local/bin" link target
+  link="$bindir/aibox"
+  target="$AIBOX_HOME/aibox"
+  mkdir -p "$bindir"
+  if [ -L "$link" ] && [ "$(readlink "$link")" = "$target" ]; then
+    : # already correct
+  elif [ -e "$link" ] && [ ! -L "$link" ]; then
+    warn "$link exists and is not a symlink; leaving it untouched."
+  else
+    ln -sf "$target" "$link"
+    info "Linked $link -> $target"
+  fi
+  case ":$PATH:" in
+    *":$bindir:"*) : ;;
+    *) offer_path_setup "$bindir" ;;
+  esac
+}
+
+do_bootstrap() {
+  info "First run — setting up AI Box..."
+  mkdir -p "$CONFIG_DIR/logs"
+  ensure_gitignore
+  write_default_config
+  setup_symlink
+  set_state first_run_complete yes
+  set_state version "$AIBOX_VERSION"
+  set_state installed_at "$(date '+%Y-%m-%d %H:%M:%S')"
+  log INFO "bootstrap complete; AIBOX_HOME=$AIBOX_HOME"
+  info "Setup complete."
+  info ""
+}
+
+bootstrap_if_needed() {
+  [ "$(get_state first_run_complete no)" = "yes" ] && return 0
+  do_bootstrap
+}
+
+# ---------------------------------------------------------------------------
+# Docker runtime detection
+# ---------------------------------------------------------------------------
+
+docker_missing_help() {
+  error "Docker is not installed (no 'docker' on PATH)."
+  if [ "$PLATFORM" = "macos" ]; then
+    info "Install one of: Docker Desktop, Colima, or OrbStack, then start it."
+  else
+    info "Install Docker Engine and ensure the service is running."
+    info "Add yourself to the 'docker' group for non-root access:"
+    info "  sudo usermod -aG docker \"\$USER\"   (then log out/in)"
+  fi
+  exit 1
+}
+
+docker_down_help() {
+  error "Docker is installed but the daemon is not reachable."
+  if [ "$PLATFORM" = "macos" ]; then
+    info "Start Docker Desktop / Colima / OrbStack and try again."
+  else
+    info "Start the daemon:  sudo systemctl start docker"
+    info "Permission denied talking to the socket usually means you are not in"
+    info "the 'docker' group. Avoid 'sudo docker' — fix group membership instead:"
+    info "  sudo usermod -aG docker \"\$USER\"   (then log out/in)"
+  fi
+  exit 1
+}
+
+check_docker() {
+  need_cmd docker || docker_missing_help
+  docker info >/dev/null 2>&1 || docker_down_help
+}
+
+# ---------------------------------------------------------------------------
+# Image & volume lifecycle
+# ---------------------------------------------------------------------------
+
+image_exists()  { docker image inspect "$1" >/dev/null 2>&1; }
+volume_exists() { docker volume inspect "$1" >/dev/null 2>&1; }
+
+build_base() {
+  local cache="${1:-}"
+  info "Building base image ($BASE_IMAGE)..."
+  log INFO "build base ($cache)"
+  docker build $cache -t "$BASE_IMAGE" \
+    -f "$AIBOX_HOME/docker/Dockerfile.base" "$AIBOX_HOME/docker"
+}
+
+build_tool_image() {
+  local tool="$1" cache="${2:-}"
+  info "Building $tool image ($(tool_image "$tool"))..."
+  log INFO "build $tool ($cache)"
+  docker build $cache -t "$(tool_image "$tool")" \
+    -f "$(tool_dockerfile "$tool")" "$AIBOX_HOME/docker"
+}
+
+ensure_base_image() { image_exists "$BASE_IMAGE" || build_base; }
+
+ensure_image() {
+  local tool="$1"
+  ensure_base_image
+  image_exists "$(tool_image "$tool")" || build_tool_image "$tool"
+}
+
+ensure_volume() {
+  local vol; vol="$(tool_volume "$1")"
+  volume_exists "$vol" || docker volume create "$vol" >/dev/null
+}
+
+# ---------------------------------------------------------------------------
+# Run a tool
+# ---------------------------------------------------------------------------
+
+run_tool() {
+  local tool="$1"; shift || true
+  validate_tool "$tool"
+  check_docker
+  ensure_image "$tool"
+  ensure_volume "$tool"
+
+  local vol; vol="$(tool_volume "$tool")"
+  set_state last_selection "$tool"
+  log INFO "run $tool cwd=$PWD"
+
+  info "${C_DIM}Workspace: $PWD -> /workspace  (the agent can read/modify/delete files here)${C_RST}"
+  if ! volume_has_login "$tool"; then
+    info "${C_DIM}First time? Log in inside the container — see: aibox --help (Authentication).${C_RST}"
+  fi
+
+  # exec so signals (Ctrl+C) go straight to docker; --init reaps & forwards.
+  exec docker run --rm -it --init \
+    -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+    -e TERM -e LANG \
+    -v "$vol":/home/aibox \
+    -v "$PWD":/workspace -w /workspace \
+    "$(tool_image "$tool")" "$@"
+}
+
+volume_has_login() {
+  # Best-effort heuristic: does the tool's volume already contain credentials?
+  local tool="$1" vol probe
+  vol="$(tool_volume "$tool")"
+  volume_exists "$vol" || return 1
+  case "$tool" in
+    claude) probe='test -e /v/.claude/.credentials.json -o -e /v/.claude.json' ;;
+    codex)  probe='test -e /v/.codex/auth.json' ;;
+    *) return 1 ;;
+  esac
+  docker run --rm -v "$vol":/v "$BASE_IMAGE" bash -lc "$probe" >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# Reset / wipe  (disposable model: operate on image + volume)
+# ---------------------------------------------------------------------------
+
+reset_tool() {
+  local tool="$1"
+  validate_tool "$tool"
+  check_docker
+  info "Resetting $tool: rebuilding image, keeping volume (you stay logged in)."
+  docker rm -f "$(tool_container "$tool")" >/dev/null 2>&1 || true
+  build_base                              # picks up Dockerfile.base changes (cached if none)
+  build_tool_image "$tool" "--no-cache"   # fresh CLI install
+  log INFO "reset $tool"
+  info "Done. Run 'aibox $tool' to use it."
+}
+
+wipe_tool() {
+  local tool="$1" assume_yes="${2:-no}"
+  validate_tool "$tool"
+  check_docker
+  if [ "$assume_yes" != "yes" ]; then
+    warn "Wipe removes the $tool image AND its volume ($(tool_volume "$tool"))."
+    warn "All logins/caches for $tool are destroyed; you must re-authenticate."
+    confirm "Type 'wipe' to confirm: " "wipe" || { info "Aborted."; return 0; }
+  fi
+  docker rm -f "$(tool_container "$tool")"   >/dev/null 2>&1 || true
+  docker rmi -f "$(tool_image "$tool")"      >/dev/null 2>&1 || true
+  docker volume rm "$(tool_volume "$tool")"  >/dev/null 2>&1 || true
+  log INFO "wipe $tool"
+  info "Wiped $tool (image + volume removed)."
+}
+
+# ---------------------------------------------------------------------------
+# Self-update (git checkout + pull)
+# ---------------------------------------------------------------------------
+
+do_update() {
+  need_cmd git || die "git not found; cannot self-update."
+  [ -d "$AIBOX_HOME/.git" ] || \
+    die "$AIBOX_HOME is not a git checkout; cannot self-update."
+  if [ -n "$(git -C "$AIBOX_HOME" status --porcelain 2>/dev/null || true)" ]; then
+    die "Local changes in $AIBOX_HOME. Commit or stash them before updating."
+  fi
+  info "Updating AI Box (git pull)..."
+  local before after
+  before="$(git -C "$AIBOX_HOME" rev-parse HEAD 2>/dev/null || echo none)"
+  git -C "$AIBOX_HOME" pull --ff-only || \
+    die "git pull failed (not fast-forwardable). Resolve manually in $AIBOX_HOME."
+  after="$(git -C "$AIBOX_HOME" rev-parse HEAD 2>/dev/null || echo none)"
+  load_version
+  set_state version "$AIBOX_VERSION"
+  set_state last_update_check "$(date '+%Y-%m-%d %H:%M:%S')"
+  log INFO "update $before -> $after (v$AIBOX_VERSION)"
+  if [ "$before" = "$after" ]; then
+    info "Already up to date (v$AIBOX_VERSION)."
+  else
+    info "Updated to v$AIBOX_VERSION."
+    if git -C "$AIBOX_HOME" diff --name-only "$before" "$after" 2>/dev/null | grep -q '^docker/'; then
+      warn "Docker files changed. Run 'aibox --reset <claude|codex>' to rebuild images."
+    fi
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Status / doctor
+# ---------------------------------------------------------------------------
+
+print_resources() {
+  if need_cmd docker && docker info >/dev/null 2>&1; then
+    info "Images:"
+    docker images --filter 'reference=aibox-*' \
+      --format '  {{.Repository}}:{{.Tag}}  {{.Size}}  ({{.CreatedSince}})' 2>/dev/null || true
+    info "Volumes:"
+    docker volume ls --filter 'name=aibox-' --format '  {{.Name}}' 2>/dev/null || true
+  else
+    info "Docker: not available"
+  fi
+}
+
+do_status() {
+  info "AI Box v$AIBOX_VERSION"
+  info "  home:     $AIBOX_HOME"
+  info "  platform: $(uname -srm)"
+  info ""
+  print_resources
+}
+
+do_doctor() {
+  local link="$HOME/.local/bin/aibox"
+  info "AI Box doctor"
+  info ""
+  info "  Version:       $AIBOX_VERSION"
+  info "  AIBOX_HOME:    $AIBOX_HOME"
+  info "  Git checkout:  $([ -d "$AIBOX_HOME/.git" ] && echo yes || echo no)"
+  info "  Platform:      $(uname -srm)"
+  info "  Shell:         ${SHELL:-unknown}"
+  info "  Bash:          ${BASH_VERSION:-unknown}"
+  if [ -L "$link" ]; then
+    info "  Symlink:       $link -> $(readlink "$link")"
+  else
+    info "  Symlink:       MISSING ($link)"
+  fi
+  case ":$PATH:" in
+    *":$HOME/.local/bin:"*) info "  PATH:          ~/.local/bin present" ;;
+    *)                      info "  PATH:          ~/.local/bin NOT on PATH" ;;
+  esac
+  if need_cmd docker; then
+    info "  Docker bin:    $(command -v docker)"
+    if docker info >/dev/null 2>&1; then
+      info "  Docker daemon: running ($(docker version --format '{{.Server.Version}}' 2>/dev/null || echo '?'))"
+    else
+      info "  Docker daemon: NOT reachable"
+    fi
+  else
+    info "  Docker bin:    NOT found"
+  fi
+  info ""
+  print_resources
+}
+
+# ---------------------------------------------------------------------------
+# Uninstall (tiered; never deletes volumes without explicit confirmation)
+# ---------------------------------------------------------------------------
+
+uninstall_files() {
+  local link="$HOME/.local/bin/aibox"
+  if [ -L "$link" ]; then rm -f "$link"; info "Removed symlink $link"; fi
+  if [ -d "$CONFIG_DIR" ]; then rm -rf "$CONFIG_DIR"; info "Removed config $CONFIG_DIR"; fi
+  info "Note: the AI Box checkout at $AIBOX_HOME was left in place; remove it with 'rm -rf' if you wish."
+}
+
+remove_images() {
+  local t
+  for t in $TOOLS; do docker rmi -f "$(tool_image "$t")" >/dev/null 2>&1 || true; done
+  docker rmi -f "$BASE_IMAGE" >/dev/null 2>&1 || true
+  info "Removed AI Box images."
+}
+
+remove_volumes() {
+  local t
+  for t in $TOOLS; do docker volume rm "$(tool_volume "$t")" >/dev/null 2>&1 || true; done
+  info "Removed AI Box volumes (logins destroyed)."
+}
+
+do_uninstall() {
+  info "Uninstall AI Box"
+  info ""
+  info "  1) Remove script symlink + config        (keep images & volumes)"
+  info "  2) Also remove AI Box images             (keep volumes/logins)"
+  info "  3) Remove EVERYTHING incl. volumes        (destroys logins)"
+  info "  q) Cancel"
+  info ""
+  local c=""; printf 'Select: ' >&2; read -r c || return 0
+  case "$c" in
+    1) uninstall_files ;;
+    2) check_docker; uninstall_files; remove_images ;;
+    3) check_docker
+       confirm "Type 'DELETE' to remove everything including volumes: " "DELETE" \
+         || { info "Cancelled."; return 0; }
+       uninstall_files; remove_images; remove_volumes ;;
+    *) info "Cancelled." ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Interactive menus
+# ---------------------------------------------------------------------------
+
+maintenance_menu() {
+  local t a tool
+  info ""
+  info "Reset / Wipe — which tool?"
+  info "  1) Claude Code"
+  info "  2) Codex"
+  info "  q) Back"
+  printf 'Select: ' >&2; read -r t || return 0
+  case "$t" in 1) tool=claude ;; 2) tool=codex ;; *) return 0 ;; esac
+  info ""
+  info "Action for $tool?"
+  info "  1) Reset  (rebuild image, KEEP login)"
+  info "  2) Wipe   (remove image + volume, LOSE login)"
+  info "  q) Back"
+  printf 'Select: ' >&2; read -r a || return 0
+  case "$a" in
+    1) reset_tool "$tool" ;;
+    2) wipe_tool "$tool" no ;;
+    *) return 0 ;;
+  esac
+}
+
+interactive_menu() {
+  local choice
+  while true; do
+    info ""
+    info "AI Box"
+    info ""
+    info "  1) Claude Code"
+    info "  2) Codex"
+    info "  3) Update AI Box"
+    info "  4) Reset / Wipe a container"
+    info "  q) Quit"
+    info ""
+    printf 'Select: ' >&2; read -r choice || exit 0
+    case "$choice" in
+      1) run_tool claude ;;   # exec — does not return
+      2) run_tool codex ;;    # exec — does not return
+      3) do_update ;;
+      4) maintenance_menu ;;
+      q|Q) exit 0 ;;
+      *) warn "Invalid choice: $choice" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Help
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat >&2 <<EOF
+aibox v$AIBOX_VERSION — run Claude Code / Codex in isolated, persistent Docker containers.
+
+USAGE
+  aibox                       Interactive menu
+  aibox claude | --claude     Run Claude Code in the current directory
+  aibox codex  | --codex      Run Codex in the current directory
+  aibox --update              Update AI Box (git pull)
+  aibox --reset <tool>        Rebuild a tool's image, KEEP its volume (stay logged in)
+  aibox --wipe  <tool> [--yes]  Remove a tool's image AND volume (lose login)
+  aibox --status              Show images, volumes, versions
+  aibox --doctor              Diagnostics
+  aibox --uninstall           Remove AI Box (tiered)
+  aibox --help | --version
+
+  <tool> is 'claude' or 'codex'.
+
+WORKSPACE
+  The current directory is bind-mounted to /workspace inside the container.
+  The agent can read, modify, and delete files there — run aibox from the
+  project you intend to work on.
+
+AUTHENTICATION (you log in once per tool; it persists in a Docker volume)
+  Claude:  inside the container run 'claude setup-token' (or 'claude' then /login).
+           Open the printed URL in your browser, authorize, paste the token back.
+  Codex:   inside the container run 'codex' and choose "Sign in with Device Code"
+           (or 'codex login --device-auth'). Open the URL, enter the code.
+  AI Box never reads or stores your credentials. Re-login is only needed after --wipe.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+
+parse_tool_arg() {
+  # Echo the tool found among the remaining args, or empty.
+  local a
+  for a in "$@"; do
+    case "$a" in claude|codex) printf '%s' "$a"; return 0 ;; esac
+  done
+  return 0
+}
+
+has_flag() {
+  local flag="$1"; shift
+  local a
+  for a in "$@"; do [ "$a" = "$flag" ] && return 0; done
+  return 1
+}
+
+main() {
+  resolve_self
+  detect_platform
+  load_version
+
+  # Commands that need neither bootstrap nor Docker.
+  case "${1:-}" in
+    --help|-h|help)     usage; exit 0 ;;
+    --version|-V|version) printf 'aibox %s\n' "$AIBOX_VERSION"; exit 0 ;;
+  esac
+
+  bootstrap_if_needed
+
+  case "${1:-}" in
+    ""|menu)            interactive_menu ;;
+    claude|--claude)    shift; run_tool claude "$@" ;;
+    codex|--codex)      shift; run_tool codex "$@" ;;
+    update|--update)    do_update ;;
+    status|--status)    do_status ;;
+    doctor|--doctor)    do_doctor ;;
+    uninstall|--uninstall) do_uninstall ;;
+    reset|--reset)
+      shift
+      local rtool; rtool="$(parse_tool_arg "$@")"
+      [ -n "$rtool" ] || die "reset: specify a tool (claude|codex)"
+      reset_tool "$rtool"
+      ;;
+    wipe|--wipe)
+      shift
+      local wtool; wtool="$(parse_tool_arg "$@")"
+      [ -n "$wtool" ] || die "wipe: specify a tool (claude|codex)"
+      if has_flag --yes "$@" || has_flag -y "$@"; then
+        wipe_tool "$wtool" yes
+      else
+        wipe_tool "$wtool" no
+      fi
+      ;;
+    *) error "Unknown command: $1"; info ""; usage; exit 2 ;;
+  esac
+}
+
+main "$@"

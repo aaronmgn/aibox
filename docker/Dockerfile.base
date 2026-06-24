@@ -1,0 +1,33 @@
+# Shared base image for AI Box tool containers.
+#   - Debian slim + common CLI tooling
+#   - A non-root 'aibox' user whose home (/home/aibox) is backed by a named
+#     volume at runtime (holds the tool's logins/caches).
+#   - An entrypoint that remaps the user to the host UID/GID, then drops
+#     privileges (so files written in /workspace stay host-editable).
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      git \
+      jq \
+      ripgrep \
+      openssh-client \
+      less \
+      unzip \
+ && rm -rf /var/lib/apt/lists/*
+
+# Non-root user; home is the volume mount point at runtime.
+RUN useradd --create-home --shell /bin/bash --uid 1000 aibox
+
+COPY entrypoint.sh /usr/local/bin/entrypoint.sh
+RUN chmod 755 /usr/local/bin/entrypoint.sh
+
+ENV HOME=/home/aibox
+WORKDIR /workspace
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["bash"]

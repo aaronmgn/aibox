@@ -1,0 +1,6 @@
+# Runtime state — never committed (see plan: config/ is user-local)
+config/
+
+# Editor / OS noise
+*.bak
+.DS_Store
