@@ -25,13 +25,20 @@ if [ "$cur_uid" != "$HOST_UID" ]; then
   usermod -o -u "$HOST_UID" "$USER_NAME" 2>/dev/null || true
 fi
 
-# Ensure the (volume-backed) home is owned by the possibly-remapped user.
-# Recurse only when the top-level owner doesn't already match — this fixes a
-# freshly seeded volume (and the rare host-UID-change case) without paying for a
-# recursive chown on every warm start.
-if [ "$(stat -c %u /home/aibox 2>/dev/null || echo -1)" != "$HOST_UID" ]; then
-  chown -R "$HOST_UID:$HOST_GID" /home/aibox 2>/dev/null || true
-fi
+# Ensure volume-backed dirs are owned by the (possibly remapped) user. Recurse
+# only when the top-level owner doesn't already match, so warm starts stay cheap.
+# /home/aibox and the tool's config dir can be backed by independent volumes that
+# may be freshly seeded (root-owned) at different times, so own each separately.
+ensure_owned() {
+  dir="$1"
+  [ -n "$dir" ] || return 0
+  mkdir -p "$dir" 2>/dev/null || true
+  if [ "$(stat -c %u "$dir" 2>/dev/null || echo -1)" != "$HOST_UID" ]; then
+    chown -R "$HOST_UID:$HOST_GID" "$dir" 2>/dev/null || true
+  fi
+}
+ensure_owned /home/aibox
+ensure_owned "${AIBOX_CONFIG_DIR:-}"
 
 export HOME="/home/aibox"
 export USER="$USER_NAME"

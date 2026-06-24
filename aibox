@@ -115,10 +115,26 @@ validate_tool() {
   esac
 }
 
-tool_image()      { printf 'aibox-%s:latest' "$1"; }
-tool_volume()     { printf 'aibox-%s-home' "$1"; }
-tool_container()  { printf 'aibox-%s' "$1"; }
-tool_dockerfile() { printf '%s/docker/Dockerfile.%s' "$AIBOX_HOME" "$1"; }
+tool_image()         { printf 'aibox-%s:latest' "$1"; }
+tool_volume()        { printf 'aibox-%s-home' "$1"; }    # general home (caches, shell)
+tool_config_volume() { printf 'aibox-%s-config' "$1"; }  # sticky login/settings/memory
+tool_container()     { printf 'aibox-%s' "$1"; }
+tool_dockerfile()    { printf '%s/docker/Dockerfile.%s' "$AIBOX_HOME" "$1"; }
+
+# Per-tool config directory inside the container (backed by the config volume) and
+# the env var each CLI uses to point at it.
+tool_config_dir() {
+  case "$1" in
+    claude) printf '/home/aibox/.claude' ;;
+    codex)  printf '/home/aibox/.codex' ;;
+  esac
+}
+tool_config_env() {
+  case "$1" in
+    claude) printf 'CLAUDE_CONFIG_DIR=%s' "$(tool_config_dir "$1")" ;;
+    codex)  printf 'CODEX_HOME=%s' "$(tool_config_dir "$1")" ;;
+  esac
+}
 
 # ---------------------------------------------------------------------------
 # Config / state (simple key=value files)
@@ -289,9 +305,11 @@ ensure_image() {
   image_exists "$(tool_image "$tool")" || build_tool_image "$tool"
 }
 
-ensure_volume() {
-  local vol; vol="$(tool_volume "$1")"
-  volume_exists "$vol" || docker volume create "$vol" >/dev/null
+ensure_volumes() {
+  local tool="$1" v
+  for v in "$(tool_volume "$tool")" "$(tool_config_volume "$tool")"; do
+    volume_exists "$v" || docker volume create "$v" >/dev/null
+  done
 }
 
 # ---------------------------------------------------------------------------
@@ -303,18 +321,24 @@ run_tool() {
   validate_tool "$tool"
   check_docker
   ensure_image "$tool"
-  ensure_volume "$tool"
+  ensure_volumes "$tool"
 
-  local vol; vol="$(tool_volume "$tool")"
+  # Refuse to mount the whole filesystem.
+  [ "$PWD" = "/" ] && \
+    die "refusing to run from / — that would mount your entire filesystem. cd into a project first."
 
-  # Mount the workspace under its folder name so the in-container path is unique
-  # per project. Claude/Codex key their per-directory memory & metadata by the
-  # working path, so a constant /workspace would merge every project together.
-  local wsname; wsname="$(basename "$PWD")"
-  case "$wsname" in ""|"/"|".") wsname="workspace" ;; esac
-  local wsdir="/workspace/$wsname"
+  local vol cfgvol cfgdir
+  vol="$(tool_volume "$tool")"
+  cfgvol="$(tool_config_volume "$tool")"
+  cfgdir="$(tool_config_dir "$tool")"
 
-  # AI Box launches each tool in bypass-permission ("yolo") mode by default.
+  # Mirror the full host path inside the container so every project gets a unique
+  # working path (e.g. /workspace/Users/you/proj/api). Claude/Codex key their
+  # per-directory memory/metadata by that path, so distinct projects never share
+  # memory — even two different folders that happen to share a name.
+  local wsdir="/workspace$PWD"
+
+  # Default bypass-permission ("yolo") launch mode.
   case "$tool" in
     claude) set -- claude --dangerously-skip-permissions "$@" ;;
     codex)  set -- codex --yolo "$@" ;;
@@ -330,25 +354,32 @@ run_tool() {
   fi
 
   # exec so signals (Ctrl+C) go straight to docker; --init reaps & forwards.
+  # The config volume is nested over the home volume so login/settings/memory live
+  # on their own sticky volume; AIBOX_CONFIG_DIR tells the entrypoint to own it.
   exec docker run --rm -it --init \
     -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     -e TERM -e LANG \
+    -e "$(tool_config_env "$tool")" \
+    -e "AIBOX_CONFIG_DIR=$cfgdir" \
     -v "$vol":/home/aibox \
+    -v "$cfgvol":"$cfgdir" \
     -v "$PWD":"$wsdir" -w "$wsdir" \
     "$(tool_image "$tool")" "$@"
 }
 
 volume_has_login() {
-  # Best-effort heuristic: does the tool's volume already contain credentials?
+  # Best-effort heuristic: does the tool's config volume already hold credentials?
+  # Probe as root (override the privilege-dropping entrypoint) so directory
+  # permissions can't cause a false negative.
   local tool="$1" vol probe
-  vol="$(tool_volume "$tool")"
+  vol="$(tool_config_volume "$tool")"
   volume_exists "$vol" || return 1
   case "$tool" in
-    claude) probe='test -e /v/.claude/.credentials.json -o -e /v/.claude.json' ;;
-    codex)  probe='test -e /v/.codex/auth.json' ;;
+    claude) probe='[ -e /v/.credentials.json ] || [ -e /v/.claude.json ]' ;;
+    codex)  probe='[ -e /v/auth.json ]' ;;
     *) return 1 ;;
   esac
-  docker run --rm -v "$vol":/v "$BASE_IMAGE" bash -lc "$probe" >/dev/null 2>&1
+  docker run --rm --entrypoint sh -v "$vol":/v "$BASE_IMAGE" -c "$probe" >/dev/null 2>&1
 }
 
 # ---------------------------------------------------------------------------
@@ -359,7 +390,7 @@ reset_tool() {
   local tool="$1"
   validate_tool "$tool"
   check_docker
-  info "Resetting $tool: rebuilding image, keeping volume (you stay logged in)."
+  info "Resetting $tool: rebuilding image, keeping volumes (you stay logged in)."
   docker rm -f "$(tool_container "$tool")" >/dev/null 2>&1 || true
   build_base                              # picks up Dockerfile.base changes (cached if none)
   build_tool_image "$tool" "--no-cache"   # fresh CLI install
@@ -372,15 +403,17 @@ wipe_tool() {
   validate_tool "$tool"
   check_docker
   if [ "$assume_yes" != "yes" ]; then
-    warn "Wipe removes the $tool image AND its volume ($(tool_volume "$tool"))."
-    warn "All logins/caches for $tool are destroyed; you must re-authenticate."
+    warn "Wipe removes the $tool image AND both volumes:"
+    warn "  $(tool_volume "$tool") (caches) and $(tool_config_volume "$tool") (login/settings/memory)."
+    warn "All logins/data for $tool are destroyed; you must re-authenticate."
     confirm "Type 'wipe' to confirm: " "wipe" || { info "Aborted."; return 0; }
   fi
-  docker rm -f "$(tool_container "$tool")"   >/dev/null 2>&1 || true
-  docker rmi -f "$(tool_image "$tool")"      >/dev/null 2>&1 || true
-  docker volume rm "$(tool_volume "$tool")"  >/dev/null 2>&1 || true
+  docker rm -f "$(tool_container "$tool")"          >/dev/null 2>&1 || true
+  docker rmi -f "$(tool_image "$tool")"             >/dev/null 2>&1 || true
+  docker volume rm "$(tool_volume "$tool")"         >/dev/null 2>&1 || true
+  docker volume rm "$(tool_config_volume "$tool")"  >/dev/null 2>&1 || true
   log INFO "wipe $tool"
-  info "Wiped $tool (image + volume removed)."
+  info "Wiped $tool (image + both volumes removed)."
 }
 
 # ---------------------------------------------------------------------------
@@ -491,7 +524,10 @@ remove_images() {
 
 remove_volumes() {
   local t
-  for t in $TOOLS; do docker volume rm "$(tool_volume "$t")" >/dev/null 2>&1 || true; done
+  for t in $TOOLS; do
+    docker volume rm "$(tool_volume "$t")"        >/dev/null 2>&1 || true
+    docker volume rm "$(tool_config_volume "$t")" >/dev/null 2>&1 || true
+  done
   info "Removed AI Box volumes (logins destroyed)."
 }
 
@@ -588,16 +624,23 @@ USAGE
   <tool> is 'claude' or 'codex'.
 
 WORKSPACE
-  The current directory is bind-mounted at /workspace/<folder-name> inside the
-  container (the folder name is kept so Claude/Codex store per-project memory
-  separately). The agent can read, modify, and delete files there — run aibox
-  from the project you intend to work on.
+  The current directory is bind-mounted at /workspace/<full-host-path> inside the
+  container (e.g. /workspace/Users/you/proj/api). Mirroring the full path means
+  Claude/Codex keep per-project memory separate for every distinct project, even
+  two folders with the same name. The agent can read, modify, and delete files
+  there — run aibox from the project you intend to work on.
 
 MODE
   Tools launch in bypass-permission ("yolo") mode by default:
   Claude with --dangerously-skip-permissions, Codex with --yolo.
 
-AUTHENTICATION (you log in once per tool; it persists in a Docker volume)
+STORAGE (per tool)
+  aibox-<tool>-config   login, settings, and per-project memory — survives
+                        --update and --reset; only --wipe (or manual removal) clears it.
+  aibox-<tool>-home     general home/caches — clear it manually with
+                        'docker volume rm aibox-<tool>-home' to keep your login.
+
+AUTHENTICATION (log in once per tool; saved on the sticky config volume)
   Claude:  inside the container run 'claude setup-token' (or 'claude' then /login).
            Open the printed URL in your browser, authorize, paste the token back.
   Codex:   inside the container run 'codex' and choose "Sign in with Device Code"

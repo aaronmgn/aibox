@@ -3,7 +3,7 @@
 Run **Claude Code** and **Codex** inside isolated, persistent Docker containers — one
 self-contained Bash script. Linux and macOS only.
 
-Each tool gets its own container image and a Docker named volume that holds its login and
+Each tool gets its own container image and Docker named volumes that hold its login and
 caches, so you authenticate **once per tool**. AI Box itself never reads or stores your
 credentials.
 
@@ -47,12 +47,12 @@ aibox --help | --version
 
 ## Workspace
 
-The directory you run `aibox` from is bind-mounted at `/workspace/<folder-name>` inside the
-container, and the tool starts there. The folder name is preserved on purpose: Claude and
-Codex store memory and metadata **per working directory**, so giving each project a distinct
-path keeps their histories separate instead of merging every project under one path.
-**The agent can read, modify, and delete files in that directory** — run AI Box from the
-project you intend to work on.
+The directory you run `aibox` from is bind-mounted at `/workspace/<full-host-path>` inside the
+container (e.g. `~/Projects/api` → `/workspace/Users/you/Projects/api`), and the tool starts
+there. The full host path is mirrored on purpose: Claude and Codex store memory and metadata
+**per working directory**, so giving each project a unique path keeps their histories separate
+— even two different folders that happen to share a name. **The agent can read, modify, and
+delete files in that directory** — run AI Box from the project you intend to work on.
 
 ## Mode
 
@@ -75,7 +75,7 @@ after `--wipe`.
 
 ## How it works
 
-- **Disposable containers**: every launch is `docker run --rm`; the named volume is the
+- **Disposable containers**: every launch is `docker run --rm`; the named volumes are the
   single source of truth for state. No long-lived containers to drift.
 - **Shared base image** (`aibox-base`) + one image per tool (`aibox-claude`, `aibox-codex`).
 - CLIs are installed under `/opt` and symlinked onto `PATH` so the home volume never shadows
@@ -83,10 +83,20 @@ after `--wipe`.
 - An entrypoint remaps the container user to your host UID/GID so files written in
   `/workspace` stay editable on the host.
 
+## Storage
+
+Each tool has **two named volumes**:
+
+- `aibox-<tool>-config` — login, settings, and per-project memory. This is the sticky one:
+  it survives `--update` and `--reset`, so you don't re-login when AI Box or the image
+  changes. (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` point each CLI here.)
+- `aibox-<tool>-home` — general home/caches. Clear it on its own with
+  `docker volume rm aibox-<tool>-home` to reset working state while staying logged in.
+
 ## Reset vs. wipe
 
-- **Reset** rebuilds the tool image and **keeps** the volume → fix a broken/stale image or
+- **Reset** rebuilds the tool image and **keeps both volumes** → fix a broken/stale image or
   apply updated Docker files; you stay logged in.
-- **Wipe** removes the image **and** the volume → clean slate; you must log in again.
+- **Wipe** removes the image **and both volumes** → full clean slate; you must log in again.
 
 Both are idempotent and safe to run repeatedly.
