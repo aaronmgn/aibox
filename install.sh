@@ -26,9 +26,13 @@ esac
 command -v git >/dev/null 2>&1 || \
   die "git is required but was not found. Install git, then re-run this command."
 
-if [ -d "$INSTALL_DIR/.git" ]; then
+if [ -e "$INSTALL_DIR/.git" ]; then
   say "Updating existing AI Box checkout at $INSTALL_DIR ..."
-  git -C "$INSTALL_DIR" pull --ff-only
+  if [ -n "$(git -C "$INSTALL_DIR" status --porcelain 2>/dev/null || true)" ]; then
+    die "Local changes in $INSTALL_DIR. Commit or stash them, then re-run."
+  fi
+  git -C "$INSTALL_DIR" pull --ff-only \
+    || die "Update failed (see git's message above). Resolve manually in $INSTALL_DIR."
 elif [ -e "$INSTALL_DIR" ]; then
   die "$INSTALL_DIR already exists and is not an AI Box checkout.
        Move it aside, or set AIBOX_DIR=<dir> to install elsewhere."

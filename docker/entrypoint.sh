@@ -15,6 +15,12 @@ USER_NAME="aibox"
 HOST_UID="${HOST_UID:-1000}"
 HOST_GID="${HOST_GID:-1000}"
 
+# Never run the agent as root inside the container, even if aibox was invoked as
+# root on the host — otherwise the privilege drop below is a no-op and the agent
+# could write root-owned files onto the bind-mounted workspace.
+[ "$HOST_UID" = "0" ] && HOST_UID=1000
+[ "$HOST_GID" = "0" ] && HOST_GID=1000
+
 cur_uid="$(id -u "$USER_NAME")"
 cur_gid="$(id -g "$USER_NAME")"
 
@@ -33,7 +39,7 @@ ensure_owned() {
   dir="$1"
   [ -n "$dir" ] || return 0
   mkdir -p "$dir" 2>/dev/null || true
-  if [ "$(stat -c %u "$dir" 2>/dev/null || echo -1)" != "$HOST_UID" ]; then
+  if [ "$(stat -c '%u:%g' "$dir" 2>/dev/null || echo -1)" != "$HOST_UID:$HOST_GID" ]; then
     chown -R "$HOST_UID:$HOST_GID" "$dir" 2>/dev/null || true
   fi
 }

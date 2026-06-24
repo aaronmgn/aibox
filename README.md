@@ -65,10 +65,10 @@ single workspace directory you mounted.
 
 - **Claude Code** — inside the container run `claude setup-token` (or `claude` then `/login`).
   Open the printed URL in your browser, authorize, and paste the token back. Stored under
-  `~/.claude/` on the `aibox-claude-home` volume.
+  `~/.claude/` (`CLAUDE_CONFIG_DIR`) on the sticky `aibox-claude-config` volume.
 - **Codex** — inside the container run `codex` and choose **"Sign in with Device Code"**
   (or `codex login --device-auth`). Open the URL on any device and enter the code. Stored at
-  `~/.codex/auth.json` on the `aibox-codex-home` volume.
+  `~/.codex/auth.json` (`CODEX_HOME`) on the sticky `aibox-codex-config` volume.
 
 Both use no inbound port, so they work in the headless container. Re-login is only needed
 after `--wipe`.

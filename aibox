@@ -69,6 +69,18 @@ confirm() {
   fi
 }
 
+read_choice() {
+  # Echo one line read from stdin, or from the controlling terminal when stdin
+  # isn't a tty (parity with confirm()). Use: var="$(read_choice)" || on-eof.
+  local ans
+  if [ -t 0 ]; then
+    read -r ans || return 1
+  else
+    { read -r ans < /dev/tty; } 2>/dev/null || return 1
+  fi
+  printf '%s' "$ans"
+}
+
 # ---------------------------------------------------------------------------
 # Self-resolution & platform
 # ---------------------------------------------------------------------------
@@ -154,7 +166,7 @@ set_state() {
   mkdir -p "$CONFIG_DIR"
   [ -f "$f" ] || : > "$f"
   if grep -qE "^${key}=" "$f" 2>/dev/null; then
-    tmp="$(mktemp "${TMPDIR:-/tmp}/aibox.XXXXXX")"
+    tmp="$(mktemp "${CONFIG_DIR}/state.conf.XXXXXX")"
     grep -vE "^${key}=" "$f" > "$tmp" || true
     printf '%s=%s\n' "$key" "$val" >> "$tmp"
     mv "$tmp" "$f"
@@ -182,6 +194,11 @@ EOF
 ensure_gitignore() {
   local f="$AIBOX_HOME/.gitignore"
   if [ ! -f "$f" ] || ! grep -qxF 'config/' "$f" 2>/dev/null; then
+    # Ensure the existing content ends in a newline first, so 'config/' is never
+    # concatenated onto a no-newline final line (which would defeat the rule).
+    if [ -s "$f" ] && [ -n "$(tail -c1 "$f" 2>/dev/null)" ]; then
+      printf '\n' >> "$f"
+    fi
     printf 'config/\n' >> "$f"
   fi
 }
@@ -327,6 +344,25 @@ run_tool() {
   [ "$PWD" = "/" ] && \
     die "refusing to run from / — that would mount your entire filesystem. cd into a project first."
 
+  # docker --mount uses commas as field separators, so a comma in the path cannot
+  # be expressed as a bind-mount source.
+  case "$PWD" in
+    *,*) die "the current path contains a comma, which docker cannot bind-mount ($PWD); rename or move the directory." ;;
+  esac
+
+  # Running aibox as root would make the in-container privilege drop a no-op; the
+  # entrypoint clamps a 0 UID/GID to non-root, but warn so it isn't silent.
+  [ "$(id -u)" -eq 0 ] && \
+    warn "Running aibox as root is discouraged; add your user to the 'docker' group instead of using sudo."
+
+  # High-risk roots: confirm before exposing a broad directory (and any secrets it
+  # holds) to an agent launched in bypass-permission mode.
+  case "$PWD" in
+    "$HOME"|"$HOME"/.ssh|"$HOME"/.aws|"$HOME"/.gnupg|"$HOME"/.config)
+      confirm "Run from $PWD? This exposes its entire contents (including any credentials) to the agent. [y/N] " \
+        || die "aborted — cd into a specific project directory first." ;;
+  esac
+
   local vol cfgvol cfgdir
   vol="$(tool_volume "$tool")"
   cfgvol="$(tool_config_volume "$tool")"
@@ -363,7 +399,7 @@ run_tool() {
     -e "AIBOX_CONFIG_DIR=$cfgdir" \
     -v "$vol":/home/aibox \
     -v "$cfgvol":"$cfgdir" \
-    -v "$PWD":"$wsdir" -w "$wsdir" \
+    --mount "type=bind,source=$PWD,target=$wsdir" -w "$wsdir" \
     "$(tool_image "$tool")" "$@"
 }
 
@@ -422,7 +458,7 @@ wipe_tool() {
 
 do_update() {
   need_cmd git || die "git not found; cannot self-update."
-  [ -d "$AIBOX_HOME/.git" ] || \
+  [ -e "$AIBOX_HOME/.git" ] || \
     die "$AIBOX_HOME is not a git checkout; cannot self-update."
   if [ -n "$(git -C "$AIBOX_HOME" status --porcelain 2>/dev/null || true)" ]; then
     die "Local changes in $AIBOX_HOME. Commit or stash them before updating."
@@ -441,6 +477,7 @@ do_update() {
     info "Already up to date (v$AIBOX_VERSION)."
   else
     info "Updated to v$AIBOX_VERSION."
+    warn "Restart aibox to run the new version (an already-open session keeps the old code)."
     if git -C "$AIBOX_HOME" diff --name-only "$before" "$after" 2>/dev/null | grep -q '^docker/'; then
       warn "Docker files changed. Run 'aibox --reset <claude|codex>' to rebuild images."
     fi
@@ -477,7 +514,7 @@ do_doctor() {
   info ""
   info "  Version:       $AIBOX_VERSION"
   info "  AIBOX_HOME:    $AIBOX_HOME"
-  info "  Git checkout:  $([ -d "$AIBOX_HOME/.git" ] && echo yes || echo no)"
+  info "  Git checkout:  $([ -e "$AIBOX_HOME/.git" ] && echo yes || echo no)"
   info "  Platform:      $(uname -srm)"
   info "  Shell:         ${SHELL:-unknown}"
   info "  Bash:          ${BASH_VERSION:-unknown}"
@@ -539,7 +576,7 @@ do_uninstall() {
   info "  3) Remove EVERYTHING incl. volumes        (destroys logins)"
   info "  q) Cancel"
   info ""
-  local c=""; printf 'Select: ' >&2; read -r c || return 0
+  local c=""; printf 'Select: ' >&2; c="$(read_choice)" || return 0
   case "$c" in
     1) uninstall_files ;;
     2) check_docker; uninstall_files; remove_images ;;
@@ -562,14 +599,14 @@ maintenance_menu() {
   info "  1) Claude Code"
   info "  2) Codex"
   info "  q) Back"
-  printf 'Select: ' >&2; read -r t || return 0
+  printf 'Select: ' >&2; t="$(read_choice)" || return 0
   case "$t" in 1) tool=claude ;; 2) tool=codex ;; *) return 0 ;; esac
   info ""
   info "Action for $tool?"
   info "  1) Reset  (rebuild image, KEEP login)"
-  info "  2) Wipe   (remove image + volume, LOSE login)"
+  info "  2) Wipe   (remove image + BOTH volumes, LOSE login)"
   info "  q) Back"
-  printf 'Select: ' >&2; read -r a || return 0
+  printf 'Select: ' >&2; a="$(read_choice)" || return 0
   case "$a" in
     1) reset_tool "$tool" ;;
     2) wipe_tool "$tool" no ;;
@@ -589,12 +626,14 @@ interactive_menu() {
     info "  4) Reset / Wipe a container"
     info "  q) Quit"
     info ""
-    printf 'Select: ' >&2; read -r choice || exit 0
+    printf 'Select: ' >&2; choice="$(read_choice)" || exit 0
     case "$choice" in
       1) run_tool claude ;;   # exec — does not return
       2) run_tool codex ;;    # exec — does not return
-      3) do_update ;;
-      4) maintenance_menu ;;
+      # Subshell so a die/build-failure in these reports and returns to the menu
+      # instead of killing the whole interactive session (set -e + bare call).
+      3) ( do_update ) || warn "Update failed — see messages above." ;;
+      4) ( maintenance_menu ) || true ;;
       q|Q) exit 0 ;;
       *) warn "Invalid choice: $choice" ;;
     esac
