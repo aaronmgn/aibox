@@ -57,10 +57,10 @@ confirm() {
   printf '%s' "$prompt" >&2
   if [ -t 0 ]; then
     read -r ans || return 1
-  elif [ -r /dev/tty ]; then
-    read -r ans < /dev/tty || return 1
   else
-    return 1
+    # Piped (e.g. curl|bash): read from the controlling terminal. The brace group
+    # captures the open error so a truly headless run fails quietly (defaults to no).
+    { read -r ans < /dev/tty; } 2>/dev/null || return 1
   fi
   if [ -n "$want" ]; then
     [ "$ans" = "$want" ]
