@@ -306,10 +306,25 @@ run_tool() {
   ensure_volume "$tool"
 
   local vol; vol="$(tool_volume "$tool")"
-  set_state last_selection "$tool"
-  log INFO "run $tool cwd=$PWD"
 
-  info "${C_DIM}Workspace: $PWD -> /workspace  (the agent can read/modify/delete files here)${C_RST}"
+  # Mount the workspace under its folder name so the in-container path is unique
+  # per project. Claude/Codex key their per-directory memory & metadata by the
+  # working path, so a constant /workspace would merge every project together.
+  local wsname; wsname="$(basename "$PWD")"
+  case "$wsname" in ""|"/"|".") wsname="workspace" ;; esac
+  local wsdir="/workspace/$wsname"
+
+  # AI Box launches each tool in bypass-permission ("yolo") mode by default.
+  case "$tool" in
+    claude) set -- claude --dangerously-skip-permissions "$@" ;;
+    codex)  set -- codex --yolo "$@" ;;
+  esac
+
+  set_state last_selection "$tool"
+  log INFO "run $tool cwd=$PWD ws=$wsdir"
+
+  info "${C_DIM}Workspace: $PWD -> $wsdir  (the agent can read/modify/delete files here)${C_RST}"
+  info "${C_DIM}Launching in bypass-permission mode (${1} ${2}).${C_RST}"
   if ! volume_has_login "$tool"; then
     info "${C_DIM}First time? Log in inside the container — see: aibox --help (Authentication).${C_RST}"
   fi
@@ -319,7 +334,7 @@ run_tool() {
     -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
     -e TERM -e LANG \
     -v "$vol":/home/aibox \
-    -v "$PWD":/workspace -w /workspace \
+    -v "$PWD":"$wsdir" -w "$wsdir" \
     "$(tool_image "$tool")" "$@"
 }
 
@@ -573,9 +588,14 @@ USAGE
   <tool> is 'claude' or 'codex'.
 
 WORKSPACE
-  The current directory is bind-mounted to /workspace inside the container.
-  The agent can read, modify, and delete files there — run aibox from the
-  project you intend to work on.
+  The current directory is bind-mounted at /workspace/<folder-name> inside the
+  container (the folder name is kept so Claude/Codex store per-project memory
+  separately). The agent can read, modify, and delete files there — run aibox
+  from the project you intend to work on.
+
+MODE
+  Tools launch in bypass-permission ("yolo") mode by default:
+  Claude with --dangerously-skip-permissions, Codex with --yolo.
 
 AUTHENTICATION (you log in once per tool; it persists in a Docker volume)
   Claude:  inside the container run 'claude setup-token' (or 'claude' then /login).

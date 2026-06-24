@@ -47,9 +47,19 @@ aibox --help | --version
 
 ## Workspace
 
-The directory you run `aibox` from is bind-mounted to `/workspace` inside the container, and
-the tool starts there. **The agent can read, modify, and delete files in that directory** —
-run AI Box from the project you intend to work on.
+The directory you run `aibox` from is bind-mounted at `/workspace/<folder-name>` inside the
+container, and the tool starts there. The folder name is preserved on purpose: Claude and
+Codex store memory and metadata **per working directory**, so giving each project a distinct
+path keeps their histories separate instead of merging every project under one path.
+**The agent can read, modify, and delete files in that directory** — run AI Box from the
+project you intend to work on.
+
+## Mode
+
+Tools launch in bypass-permission ("yolo") mode by default — Claude with
+`--dangerously-skip-permissions`, Codex with `--yolo` — so they run without stopping for
+approval prompts. This is appropriate because each tool is confined to its container and the
+single workspace directory you mounted.
 
 ## Authentication (once per tool, persisted in the volume)
 
