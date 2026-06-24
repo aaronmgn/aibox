@@ -46,6 +46,19 @@ ensure_owned() {
 ensure_owned /home/aibox
 ensure_owned "${AIBOX_CONFIG_DIR:-}"
 
+# Own the intermediate parent dirs of any read-only shares. Docker pre-creates
+# them (e.g. /home/aibox/.config for a .config/gh mount) as root before this
+# runs, and the warm-start optimization above may skip the recursive chown — so
+# own each explicitly (non-recursive; never touches the read-only mount itself).
+if [ -n "${AIBOX_OWN_DIRS:-}" ]; then
+  _oifs="$IFS"; IFS=':'
+  for _d in $AIBOX_OWN_DIRS; do
+    [ -n "$_d" ] || continue
+    chown "$HOST_UID:$HOST_GID" "$_d" 2>/dev/null || true
+  done
+  IFS="$_oifs"
+fi
+
 export HOME="/home/aibox"
 export USER="$USER_NAME"
 export LOGNAME="$USER_NAME"

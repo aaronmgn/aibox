@@ -43,7 +43,7 @@ fi
 
 # First-run setup: creates config, symlinks ~/.local/bin/aibox, offers PATH setup
 # (prompts via /dev/tty so it still works through this pipe), then prints diagnostics.
-"$INSTALL_DIR/aibox" --doctor
+"$INSTALL_DIR/aibox" --diagnostics
 
 say ""
 say "AI Box installed at $INSTALL_DIR"

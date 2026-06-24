@@ -24,4 +24,17 @@ RUN set -eux; \
     HOME=/tmp/verify claude --version; \
     rm -rf /tmp/verify
 
+# Don't attribute commits/PRs to Claude. Baked as a managed (system) setting so it
+# applies regardless of the user's ~/.claude volume and takes precedence over it.
+# Both keys are set for version coverage: includeCoAuthoredBy drops the
+# "Co-Authored-By: Claude" commit trailer; the attribution object drops the
+# "Generated with Claude Code" commit/PR line.
+RUN mkdir -p /etc/claude-code \
+ && printf '%s\n' \
+      '{' \
+      '  "includeCoAuthoredBy": false,' \
+      '  "attribution": { "commit": "", "pr": "" }' \
+      '}' \
+      > /etc/claude-code/managed-settings.json
+
 CMD ["claude"]

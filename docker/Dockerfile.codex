@@ -22,4 +22,22 @@ RUN set -eux; \
     HOME=/tmp/verify codex --version; \
     rm -rf /tmp/verify
 
+# Don't attribute commits to Codex. Codex only adds a "Co-authored-by: Codex"
+# trailer when features.codex_git_commit is on (off by default). Pin it off in the
+# system config (default layer) AND enforce it un-overridably via requirements.toml,
+# and empty the trailer as belt-and-suspenders. Baked at /etc/codex, which Codex
+# reads outside CODEX_HOME, so the ~/.codex volume can't shadow it.
+# Note: commit_attribution is a TOP-LEVEL key and must precede the [features] table.
+RUN mkdir -p /etc/codex \
+ && printf '%s\n' \
+      'commit_attribution = ""' \
+      '' \
+      '[features]' \
+      'codex_git_commit = false' \
+      > /etc/codex/config.toml \
+ && printf '%s\n' \
+      '[features]' \
+      'codex_git_commit = false' \
+      > /etc/codex/requirements.toml
+
 CMD ["codex"]

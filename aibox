@@ -243,6 +243,7 @@ do_bootstrap() {
   mkdir -p "$CONFIG_DIR/logs"
   ensure_gitignore
   write_default_config
+  ensure_mounts_config
   setup_symlink
   set_state first_run_complete yes
   set_state version "$AIBOX_VERSION"
@@ -330,6 +331,114 @@ ensure_volumes() {
 }
 
 # ---------------------------------------------------------------------------
+# Host path sharing (read-only credential/config mounts)
+# ---------------------------------------------------------------------------
+
+ensure_mounts_config() {
+  # Create the share list on first need. Pre-enables .ssh and .config/gh so git
+  # over SSH and the gh CLI work inside the container out of the box.
+  local f="$CONFIG_DIR/mounts.conf"
+  [ -f "$f" ] && return 0
+  mkdir -p "$CONFIG_DIR"
+  cat > "$f" <<'EOF'
+# Host paths shared with the container, one per line, relative to your $HOME.
+# Each is bind-mounted READ-ONLY at the same path inside the container's home so
+# the agent can use your existing credentials and config.
+#
+# SECURITY: anything listed here is readable by the agent, which runs in
+# bypass-permission mode with network access — it can read a shared SSH key or
+# token and send it anywhere. Only share paths you trust it with. Comment a line
+# out (#) to stop sharing it. A '#' also starts an inline comment.
+# (aibox asks for confirmation once, the first time a path is actually shared.)
+
+.ssh             # git over SSH (keys, known_hosts)
+.config/gh       # GitHub CLI token + host config
+
+# Uncomment or add more as needed:
+# .gitconfig     # git identity/aliases (may reference host-only helpers)
+# .aws           # AWS credentials/config
+# .kube          # kubeconfig
+# .config/gcloud # Google Cloud
+EOF
+  log INFO "wrote default mounts.conf"
+}
+
+# Trim leading/trailing whitespace (portable; Bash 3.2 safe).
+trim_ws() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+collect_extra_mounts() {
+  # Populate globals from mounts.conf:
+  #   EXTRA_MOUNTS         docker --mount args (read-only binds)
+  #   EXTRA_MOUNT_NAMES    comma-separated list, for messages
+  #   EXTRA_MOUNT_OWN_DIRS ':'-joined intermediate parent dirs for the entrypoint
+  #                        to chown (docker auto-creates them root-owned)
+  # Entries are $HOME-relative. The case check blocks textual traversal only
+  # (absolute paths, '..', commas); a symlink inside $HOME is followed and trusted
+  # — it's your own config file listing your own paths.
+  EXTRA_MOUNTS=()
+  EXTRA_MOUNT_NAMES=""
+  EXTRA_MOUNT_OWN_DIRS=""
+  local f="$CONFIG_DIR/mounts.conf" line rel src tgt parent acc head remainder
+  [ -f "$f" ] || return 0
+  # All entries are $HOME-relative; without a usable HOME there is nothing to do.
+  [ -n "${HOME:-}" ] && [ -d "$HOME" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    rel="$(trim_ws "${line%%#*}")"          # drop inline/whole-line comments, trim
+    [ -n "$rel" ] || continue
+    case "$rel" in
+      /*|*..*|*,*)
+        warn "mounts.conf: ignoring '$rel' (no absolute paths, '..', or ',')."
+        continue ;;
+    esac
+    src="$HOME/$rel"
+    [ -e "$src" ] || { log INFO "skip share (missing): $src"; continue; }
+    tgt="/home/aibox/$rel"
+    EXTRA_MOUNTS+=( --mount "type=bind,source=$src,target=$tgt,readonly" )
+    if [ -z "$EXTRA_MOUNT_NAMES" ]; then
+      EXTRA_MOUNT_NAMES="$rel"
+    else
+      EXTRA_MOUNT_NAMES="$EXTRA_MOUNT_NAMES, $rel"
+    fi
+    # For a nested target (e.g. .config/gh) docker pre-creates the intermediate
+    # dirs (/home/aibox/.config) as root; record each so the entrypoint can own
+    # them, otherwise the agent can't write under them on warm starts.
+    case "$rel" in
+      */*)
+        parent="${rel%/*}"; acc=""; remainder="$parent"
+        while [ -n "$remainder" ]; do
+          head="${remainder%%/*}"
+          if [ -z "$acc" ]; then acc="$head"; else acc="$acc/$head"; fi
+          EXTRA_MOUNT_OWN_DIRS="$EXTRA_MOUNT_OWN_DIRS:/home/aibox/$acc"
+          [ "$remainder" = "$head" ] && remainder="" || remainder="${remainder#*/}"
+        done ;;
+    esac
+  done < "$f"
+}
+
+maybe_confirm_mounts() {
+  # One-time consent before exposing credential/config paths to the agent, which
+  # runs in bypass-permission mode with network access — it can READ a shared SSH
+  # private key or token and send it anywhere. Acknowledged once, then remembered.
+  [ -n "$EXTRA_MOUNT_NAMES" ] || return 0
+  [ "$(get_state mounts_acknowledged no)" = "yes" ] && return 0
+  warn "Sharing these host paths read-only with the agent: $EXTRA_MOUNT_NAMES"
+  warn "It can read their contents (SSH keys, tokens, …) and has network access."
+  if confirm "Allow? (edit config/mounts.conf to change the list) [y/N] "; then
+    set_state mounts_acknowledged yes
+  else
+    info "Continuing without shared paths this run."
+    EXTRA_MOUNTS=()
+    EXTRA_MOUNT_NAMES=""
+    EXTRA_MOUNT_OWN_DIRS=""
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Run a tool
 # ---------------------------------------------------------------------------
 
@@ -368,6 +477,12 @@ run_tool() {
   cfgvol="$(tool_config_volume "$tool")"
   cfgdir="$(tool_config_dir "$tool")"
 
+  # Host paths the user has opted to share (e.g. ~/.ssh, ~/.config/gh), bind-mounted
+  # read-only into the container home so git/gh/etc. can use existing credentials.
+  ensure_mounts_config
+  collect_extra_mounts
+  maybe_confirm_mounts
+
   # Mirror the full host path inside the container so every project gets a unique
   # working path (e.g. /workspace/Users/you/proj/api). Claude/Codex key their
   # per-directory memory/metadata by that path, so distinct projects never share
@@ -385,6 +500,8 @@ run_tool() {
 
   info "${C_DIM}Workspace: $PWD -> $wsdir  (the agent can read/modify/delete files here)${C_RST}"
   info "${C_DIM}Launching in bypass-permission mode (${1} ${2}).${C_RST}"
+  [ -n "$EXTRA_MOUNT_NAMES" ] && \
+    info "${C_DIM}Sharing read-only: $EXTRA_MOUNT_NAMES${C_RST}"
   if ! volume_has_login "$tool"; then
     info "${C_DIM}First time? Log in inside the container — see: aibox --help (Authentication).${C_RST}"
   fi
@@ -397,9 +514,11 @@ run_tool() {
     -e TERM -e LANG \
     -e "$(tool_config_env "$tool")" \
     -e "AIBOX_CONFIG_DIR=$cfgdir" \
+    -e "AIBOX_OWN_DIRS=${EXTRA_MOUNT_OWN_DIRS#:}" \
     -v "$vol":/home/aibox \
     -v "$cfgvol":"$cfgdir" \
     --mount "type=bind,source=$PWD,target=$wsdir" -w "$wsdir" \
+    ${EXTRA_MOUNTS[@]+"${EXTRA_MOUNTS[@]}"} \
     "$(tool_image "$tool")" "$@"
 }
 
@@ -485,7 +604,7 @@ do_update() {
 }
 
 # ---------------------------------------------------------------------------
-# Status / doctor
+# Status / diagnostics
 # ---------------------------------------------------------------------------
 
 print_resources() {
@@ -508,9 +627,9 @@ do_status() {
   print_resources
 }
 
-do_doctor() {
+do_diagnostics() {
   local link="$HOME/.local/bin/aibox"
-  info "AI Box doctor"
+  info "AI Box diagnostics"
   info ""
   info "  Version:       $AIBOX_VERSION"
   info "  AIBOX_HOME:    $AIBOX_HOME"
@@ -536,6 +655,13 @@ do_doctor() {
     fi
   else
     info "  Docker bin:    NOT found"
+  fi
+  ensure_mounts_config
+  collect_extra_mounts
+  if [ -n "$EXTRA_MOUNT_NAMES" ]; then
+    info "  Shared (ro):   $EXTRA_MOUNT_NAMES"
+  else
+    info "  Shared (ro):   none configured/present"
   fi
   info ""
   print_resources
@@ -656,7 +782,7 @@ USAGE
   aibox --reset <tool>        Rebuild a tool's image, KEEP its volume (stay logged in)
   aibox --wipe  <tool> [--yes]  Remove a tool's image AND volume (lose login)
   aibox --status              Show images, volumes, versions
-  aibox --doctor              Diagnostics
+  aibox --diagnostics         Environment diagnostics
   aibox --uninstall           Remove AI Box (tiered)
   aibox --help | --version
 
@@ -672,6 +798,12 @@ WORKSPACE
 MODE
   Tools launch in bypass-permission ("yolo") mode by default:
   Claude with --dangerously-skip-permissions, Codex with --yolo.
+
+SHARING HOST CREDENTIALS (read-only)
+  Paths in config/mounts.conf are bind-mounted read-only into the container so
+  git, the gh CLI, and other tools can use your existing credentials. .ssh and
+  .config/gh are shared by default; add .aws, .kube, etc. — one \$HOME-relative
+  path per line. Only list paths you are willing to expose to the agent.
 
 STORAGE (per tool)
   aibox-<tool>-config   login, settings, and per-project memory — survives
@@ -727,7 +859,7 @@ main() {
     codex|--codex)      shift; run_tool codex "$@" ;;
     update|--update)    do_update ;;
     status|--status)    do_status ;;
-    doctor|--doctor)    do_doctor ;;
+    diagnostics|--diagnostics) do_diagnostics ;;
     uninstall|--uninstall) do_uninstall ;;
     reset|--reset)
       shift

@@ -1,32 +1,26 @@
 # AI Box
 
-Run **Claude Code** and **Codex** inside isolated, persistent Docker containers — one
-self-contained Bash script. Linux and macOS only.
+Run **Claude Code** and **Codex** in isolated, persistent Docker containers — one
+self-contained Bash script. Linux and macOS.
 
-Each tool gets its own container image and Docker named volumes that hold its login and
-caches, so you authenticate **once per tool**. AI Box itself never reads or stores your
-credentials.
+Each tool gets its own image and named volumes for its login and caches, so you
+authenticate **once per tool**. AI Box never reads or stores your credentials.
 
 ## Install
-
-One line, Linux and macOS:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/aaronmgn/aibox/main/install.sh | bash
 ```
 
-This clones AI Box to `~/aibox`, symlinks `~/.local/bin/aibox` onto your `PATH` (offering to
-update your shell rc if needed), and writes default settings under `config/` (gitignored).
-Building container images is deferred until you first run a tool. Set `AIBOX_DIR=<path>` to
-install somewhere else.
-
-Prefer to inspect first? Do it by hand — the git checkout *is* the install location:
+Clones AI Box to `~/aibox`, symlinks `~/.local/bin/aibox` onto your `PATH`, and writes
+defaults under `config/` (gitignored). Images build on first use. Set `AIBOX_DIR=<path>`
+to install elsewhere, or clone by hand — the checkout *is* the install:
 
 ```sh
 git clone https://github.com/aaronmgn/aibox.git ~/aibox && ~/aibox/aibox
 ```
 
-Requires: Docker (Desktop, Colima, OrbStack, or native Engine) and `git`.
+Requires Docker (Desktop, Colima, OrbStack, or Engine) and `git`.
 
 ## Usage
 
@@ -34,11 +28,11 @@ Requires: Docker (Desktop, Colima, OrbStack, or native Engine) and `git`.
 aibox                    # interactive menu
 aibox claude             # run Claude Code in the current directory
 aibox codex              # run Codex in the current directory
-aibox --update           # update AI Box (git pull) and rebuild advice
-aibox --reset <tool>     # rebuild a tool's image, KEEP its volume (stay logged in)
-aibox --wipe <tool>      # remove a tool's image AND volume (lose login); add --yes to skip prompt
+aibox --update           # update AI Box (git pull)
+aibox --reset <tool>     # rebuild image, keep volumes (stay logged in)
+aibox --wipe  <tool>     # remove image + volumes (lose login); --yes skips the prompt
 aibox --status           # images, volumes, versions
-aibox --doctor           # diagnostics
+aibox --diagnostics      # environment diagnostics
 aibox --uninstall        # tiered removal
 aibox --help | --version
 ```
@@ -47,56 +41,60 @@ aibox --help | --version
 
 ## Workspace
 
-The directory you run `aibox` from is bind-mounted at `/workspace/<full-host-path>` inside the
-container (e.g. `~/Projects/api` → `/workspace/Users/you/Projects/api`), and the tool starts
-there. The full host path is mirrored on purpose: Claude and Codex store memory and metadata
-**per working directory**, so giving each project a unique path keeps their histories separate
-— even two different folders that happen to share a name. **The agent can read, modify, and
-delete files in that directory** — run AI Box from the project you intend to work on.
+The directory you run `aibox` from is bind-mounted at `/workspace/<full-host-path>`
+(e.g. `~/Projects/api` → `/workspace/Users/you/Projects/api`), and the tool starts there.
+The full path is mirrored so Claude and Codex keep per-project memory separate — even
+folders that share a name. **The agent can read, modify, and delete files there**, so run
+AI Box from the project you intend to work on.
 
 ## Mode
 
-Tools launch in bypass-permission ("yolo") mode by default — Claude with
-`--dangerously-skip-permissions`, Codex with `--yolo` — so they run without stopping for
-approval prompts. This is appropriate because each tool is confined to its container and the
-single workspace directory you mounted.
+Tools launch in bypass-permission ("yolo") mode — Claude with
+`--dangerously-skip-permissions`, Codex with `--yolo` — so they run without approval
+prompts. That's appropriate because each tool is confined to its container and the single
+workspace directory you mounted.
 
-## Authentication (once per tool, persisted in the volume)
+## Sharing host credentials
 
-- **Claude Code** — inside the container run `claude setup-token` (or `claude` then `/login`).
-  Open the printed URL in your browser, authorize, and paste the token back. Stored under
-  `~/.claude/` (`CLAUDE_CONFIG_DIR`) on the sticky `aibox-claude-config` volume.
-- **Codex** — inside the container run `codex` and choose **"Sign in with Device Code"**
-  (or `codex login --device-auth`). Open the URL on any device and enter the code. Stored at
-  `~/.codex/auth.json` (`CODEX_HOME`) on the sticky `aibox-codex-config` volume.
+Paths listed in `config/mounts.conf` are bind-mounted **read-only** into the container's
+home so tools can use your existing credentials. `.ssh` (git over SSH) and `.config/gh`
+(GitHub CLI token) are shared by default; uncomment or add more — `.aws`, `.kube`,
+`.gitconfig`, … one `$HOME`-relative path per line. The first time a path is actually
+shared, AI Box asks you to confirm once (then remembers).
 
-Both use no inbound port, so they work in the headless container. Re-login is only needed
-after `--wipe`.
+> ⚠️ The agent runs in bypass-permission mode with network access, so it can **read** a
+> shared SSH key or token and send it anywhere. Only share paths you trust it with; comment
+> a line out to stop sharing it.
 
-## How it works
+## Authentication (once per tool)
 
-- **Disposable containers**: every launch is `docker run --rm`; the named volumes are the
-  single source of truth for state. No long-lived containers to drift.
-- **Shared base image** (`aibox-base`) + one image per tool (`aibox-claude`, `aibox-codex`).
-- CLIs are installed under `/opt` and symlinked onto `PATH` so the home volume never shadows
-  or pins them.
-- An entrypoint remaps the container user to your host UID/GID so files written in
-  `/workspace` stay editable on the host.
+- **Claude Code** — in the container run `claude setup-token` (or `claude` then `/login`),
+  open the URL, paste the token back. Stored under `~/.claude/`.
+- **Codex** — in the container run `codex` and choose **"Sign in with Device Code"** (or
+  `codex login --device-auth`), open the URL, enter the code. Stored at `~/.codex/auth.json`.
+
+Both work headless (no inbound port). Re-login is only needed after `--wipe`.
 
 ## Storage
 
-Each tool has **two named volumes**:
+Each tool has two named volumes:
 
-- `aibox-<tool>-config` — login, settings, and per-project memory. This is the sticky one:
-  it survives `--update` and `--reset`, so you don't re-login when AI Box or the image
-  changes. (`CLAUDE_CONFIG_DIR` / `CODEX_HOME` point each CLI here.)
+- `aibox-<tool>-config` — login, settings, per-project memory. Sticky: survives `--update`
+  and `--reset`; only `--wipe` clears it.
 - `aibox-<tool>-home` — general home/caches. Clear it on its own with
   `docker volume rm aibox-<tool>-home` to reset working state while staying logged in.
 
-## Reset vs. wipe
+**Reset** rebuilds the image and keeps both volumes (you stay logged in). **Wipe** removes
+the image and both volumes (full clean slate; log in again). Both are idempotent.
 
-- **Reset** rebuilds the tool image and **keeps both volumes** → fix a broken/stale image or
-  apply updated Docker files; you stay logged in.
-- **Wipe** removes the image **and both volumes** → full clean slate; you must log in again.
+## How it works
 
-Both are idempotent and safe to run repeatedly.
+- Every launch is `docker run --rm`; the named volumes are the only state.
+- Shared base image (`aibox-base`) + one image per tool (`aibox-claude`, `aibox-codex`).
+- CLIs live under `/opt` and are symlinked onto `PATH`, so the home volume never shadows
+  them.
+- The entrypoint remaps the container user to your host UID/GID, so files written in
+  `/workspace` stay editable on the host.
+- Commits and PRs the agents make aren't attributed to Claude/Codex as a co-author —
+  baked into the images as a managed/system setting (`/etc/claude-code/managed-settings.json`,
+  `/etc/codex/config.toml`), so it survives the config volumes.

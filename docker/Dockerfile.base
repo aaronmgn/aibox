@@ -23,6 +23,13 @@ RUN apt-get update \
 # Non-root user; home is the volume mount point at runtime.
 RUN useradd --create-home --shell /bin/bash --uid 1000 aibox
 
+# When ~/.ssh is shared read-only, SSH can't record newly-accepted host keys
+# there. List a writable file first so accepted keys persist across runs, while
+# the user's (read-only) known_hosts is still consulted for already-trusted hosts.
+RUN mkdir -p /etc/ssh/ssh_config.d \
+ && printf 'Host *\n    UserKnownHostsFile ~/.aibox_known_hosts ~/.ssh/known_hosts\n' \
+      > /etc/ssh/ssh_config.d/aibox.conf
+
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 755 /usr/local/bin/entrypoint.sh
 
