@@ -51,9 +51,17 @@ confirm() {
   # confirm PROMPT [REQUIRED_WORD]
   # With REQUIRED_WORD: succeeds only on an exact match.
   # Without it: y/yes (case-insensitive) succeeds.
+  # Reads from /dev/tty when stdin isn't a terminal so prompts still work when
+  # AI Box is run through a pipe (e.g. `curl ... | bash`).
   local prompt="$1" want="${2:-}" ans=""
   printf '%s' "$prompt" >&2
-  read -r ans || return 1
+  if [ -t 0 ]; then
+    read -r ans || return 1
+  elif [ -r /dev/tty ]; then
+    read -r ans < /dev/tty || return 1
+  else
+    return 1
+  fi
   if [ -n "$want" ]; then
     [ "$ans" = "$want" ]
   else

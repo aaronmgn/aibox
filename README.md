@@ -9,14 +9,22 @@ credentials.
 
 ## Install
 
+One line, Linux and macOS:
+
 ```sh
-git clone <repo-url> ~/aibox
-~/aibox/aibox            # first run sets up config + symlinks ~/.local/bin/aibox
+curl -fsSL https://raw.githubusercontent.com/aaronmgn/aibox/main/install.sh | bash
 ```
 
-The git checkout *is* the install location. First run creates `config/` (gitignored),
-symlinks `~/.local/bin/aibox` onto your `PATH` (offering to update your shell rc if needed),
-and writes default settings. Building container images is deferred until you first run a tool.
+This clones AI Box to `~/aibox`, symlinks `~/.local/bin/aibox` onto your `PATH` (offering to
+update your shell rc if needed), and writes default settings under `config/` (gitignored).
+Building container images is deferred until you first run a tool. Set `AIBOX_DIR=<path>` to
+install somewhere else.
+
+Prefer to inspect first? Do it by hand — the git checkout *is* the install location:
+
+```sh
+git clone https://github.com/aaronmgn/aibox.git ~/aibox && ~/aibox/aibox
+```
 
 Requires: Docker (Desktop, Colima, OrbStack, or native Engine) and `git`.
 
