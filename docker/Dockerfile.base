@@ -18,7 +18,74 @@ RUN apt-get update \
       openssh-client \
       less \
       unzip \
+      gzip \
  && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Cloud / Kubernetes / Python CLIs available to every tool:
+#   kubectl, AWS CLI v2, argo (Argo Workflows), uv (Python), flux (FluxCD).
+# Installed onto the system PATH (/usr/local/bin) — NOT under /home/aibox,
+# which a named volume shadows at runtime. Each CLI reads its own
+# credentials/config from $HOME at runtime (~/.kube, ~/.aws, ~/.config/uv),
+# which is the persistent home volume, so logins/contexts survive restarts.
+# ---------------------------------------------------------------------------
+
+# Raw-binary downloads that need the target architecture (amd64 / arm64).
+# ARGO_VERSION=latest resolves the newest release via the GitHub API; pin it
+# (e.g. --build-arg ARGO_VERSION=v3.6.2) for a reproducible build.
+ARG ARGO_VERSION=latest
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) aws_arch=x86_64 ;; \
+      arm64) aws_arch=aarch64 ;; \
+      *) echo "unsupported architecture: $arch" >&2; exit 1 ;; \
+    esac; \
+    \
+    # kubectl (latest stable) \
+    kver="$(curl -fsSL https://dl.k8s.io/release/stable.txt)"; \
+    curl -fsSL -o /usr/local/bin/kubectl \
+      "https://dl.k8s.io/release/${kver}/bin/linux/${arch}/kubectl"; \
+    chmod 0755 /usr/local/bin/kubectl; \
+    \
+    # AWS CLI v2 (self-contained bundle under /opt; symlinks aws -> /usr/local/bin) \
+    tmp="$(mktemp -d)"; \
+    curl -fsSL -o "$tmp/awscliv2.zip" \
+      "https://awscli.amazonaws.com/awscli-exe-linux-${aws_arch}.zip"; \
+    unzip -q "$tmp/awscliv2.zip" -d "$tmp"; \
+    "$tmp/aws/install" --install-dir /opt/aws-cli --bin-dir /usr/local/bin; \
+    chmod -R a+rX /opt/aws-cli; \
+    rm -rf "$tmp"; \
+    \
+    # argo (Argo Workflows CLI) \
+    av="$ARGO_VERSION"; \
+    if [ "$av" = "latest" ]; then \
+      av="$(curl -fsSL https://api.github.com/repos/argoproj/argo-workflows/releases/latest | jq -r .tag_name)"; \
+    fi; \
+    curl -fsSL -o /tmp/argo.gz \
+      "https://github.com/argoproj/argo-workflows/releases/download/${av}/argo-linux-${arch}.gz"; \
+    gunzip -f /tmp/argo.gz; \
+    install -m 0755 /tmp/argo /usr/local/bin/argo; \
+    rm -f /tmp/argo; \
+    \
+    kubectl version --client=true; \
+    aws --version; \
+    argo version --short
+
+# Installer scripts that detect the architecture themselves. Pinned to the
+# system PATH and told not to touch any shell rc.
+RUN set -eux; \
+    # uv (Python package/project manager) + uvx \
+    UV_INSTALL_DIR=/usr/local/bin INSTALLER_NO_MODIFY_PATH=1 \
+      sh -c 'curl -fsSL https://astral.sh/uv/install.sh | sh'; \
+    chmod 0755 /usr/local/bin/uv /usr/local/bin/uvx; \
+    \
+    # flux (FluxCD CLI) — installer honours BIN_DIR \
+    curl -fsSL https://fluxcd.io/install.sh | BIN_DIR=/usr/local/bin bash; \
+    chmod 0755 /usr/local/bin/flux; \
+    \
+    uv --version; \
+    flux --version
 
 # Non-root user; home is the volume mount point at runtime.
 RUN useradd --create-home --shell /bin/bash --uid 1000 aibox
